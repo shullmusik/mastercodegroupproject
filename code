@@ -1,0 +1,174 @@
+# social_loader.py (requiere: pandas, numpy, requests)
+import json
+import time
+from typing import Generator, Optional, Tuple
+import numpy as np
+import pandas as pd
+import requests
+
+API_ENDPOINT = "https://api.stocktwits.com/api/2/streams/symbol/{sym}.json"
+
+def fetch_symbol_stream(sym: str, pages: int = 5, out_path: str = "raw.jsonl", pause: float = 2.0) -> None:
+    """
+    Extrae mensajes recientes de un ticker específico de StockTwits 
+    y los guarda en formato JSON lines (JSONL).
+    
+    Args:
+        sym (str): Símbolo del ticker (ej. 'AAPL').
+        pages (int): Número de páginas a solicitar.
+        out_path (str): Ruta del archivo de salida.
+        pause (float): Segundos de pausa entre solicitudes para evitar límites de tasa.
+    """
+    cursor: Optional[str] = None
+    
+    try:
+        with open(out_path, "a", encoding="utf-8") as f:
+            for _ in range(pages):
+                params = {"max": cursor} if cursor else {}
+                response = requests.get(API_ENDPOINT.format(sym=sym), params=params, timeout=30)
+                response.raise_for_status()
+                
+                data = response.json()
+                messages = data.get("messages", [])
+                
+                for msg in messages:
+                    f.write(json.dumps(msg) + "\n")
+                
+                cursor_info = data.get("cursor", {})
+                cursor = cursor_info.get("max")
+                
+                if not cursor_info.get("more", False):
+                    break
+                    
+                time.sleep(pause)
+                
+    except requests.exceptions.RequestException as e:
+        print(f"Error al conectar con la API de StockTwits para {sym}: {e}")
+
+
+def load_messages(path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Carga un archivo JSONL con mensajes sin procesar y los normaliza 
+    en tres tablas: mensajes, usuarios y relación mensaje-símbolos.
+    
+    Args:
+        path (str): Ruta al archivo JSONL.
+        
+    Returns:
+        Tuple conteniendo los DataFrames de messages, users y message_symbols.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        raw_data = [json.loads(line) for line in f]
+        
+    if not raw_data:
+        empty_df = pd.DataFrame()
+        return empty_df, empty_df, empty_df
+
+    flat = pd.json_normalize(raw_data, sep="_")
+
+    # 1. Tabla de mensajes
+    messages = pd.DataFrame({
+        "msg_id": flat.get("id"),
+        "user_id": flat.get("user_id"),
+        "created_utc": pd.to_datetime(flat.get("created_at"), errors="coerce", utc=True),
+        "body": flat.get("body"),
+        "likes": flat.get("likes_total", 0),
+        "label": flat.get("entities_sentiment_basic"),
+    }).drop_duplicates("msg_id")
+
+    # 2. Tabla de usuarios
+    user_cols = [c for c in ["user_id", "user_username", "user_followers", "user_join_date"] if c in flat.columns]
+    if user_cols:
+        users = (flat[user_cols]
+                 .drop_duplicates("user_id")
+                 .rename(columns=lambda c: c.replace("user_", "")))
+        if "id" in users.columns:
+            users = users.rename(columns={"id": "user_id"})
+        if "join_date" in users.columns:
+            users["join_date"] = pd.to_datetime(users["join_date"], errors="coerce")
+    else:
+        users = pd.DataFrame()
+
+    # 3. Relación mensajes y símbolos (maneja múltiples tickers por mensaje)
+    if "id" in flat.columns and "symbols" in flat.columns:
+        message_symbols = pd.DataFrame({
+            "msg_id": flat["id"], 
+            "symbols": flat["symbols"]
+        }).explode("symbols").dropna(subset=["symbols"])
+        
+        message_symbols["ticker"] = message_symbols["symbols"].apply(
+            lambda x: x.get("symbol") if isinstance(x, dict) else None
+        )
+        message_symbols = message_symbols[["msg_id", "ticker"]].dropna().drop_duplicates()
+    else:
+        message_symbols = pd.DataFrame(columns=["msg_id", "ticker"])
+
+    return messages, users, message_symbols
+
+
+def assign_trading_date(messages: pd.DataFrame, trading_days: pd.DatetimeIndex, close_hour: int = 16) -> pd.DataFrame:
+    """
+    Asigna cada publicación a la sesión bursátil que puede afectar.
+    Los posts posteriores al cierre o en fines de semana pasan al siguiente día hábil.
+    """
+    out = messages.copy()
+    et = out["created_utc"].dt.tz_convert("America/New_York")
+    cutoff_date = et.dt.tz_localize(None).dt.normalize()
+    
+    after_close = et.dt.hour >= close_hour
+    cutoff_date = cutoff_date + pd.to_timedelta(after_close.astype(int), unit="D")
+    
+    days = pd.DatetimeIndex(sorted(trading_days))
+    idx = days.searchsorted(cutoff_date)
+    
+    out["et_time"] = et
+    valid_idx = np.minimum(idx, len(days) - 1)
+    out["trading_date"] = days[valid_idx]
+    out.loc[idx >= len(days), "trading_date"] = pd.NaT
+    
+    return out
+
+
+def daily_panel(messages: pd.DataFrame, message_symbols: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Agrega métricas de sentimiento e interacciones por ticker y día de negociación,
+    fusionándolas con los precios y retornos históricos de las acciones.
+    """
+    df = message_symbols.merge(messages, on="msg_id", how="inner")
+    g = df.groupby(["ticker", "trading_date"])
+    
+    panel = pd.DataFrame({
+        "n_msgs": g.size(),
+        "n_users": g["user_id"].nunique(),
+        "n_bull": g["label"].apply(lambda s: (s == "Bullish").sum()),
+        "n_bear": g["label"].apply(lambda s: (s == "Bearish").sum()),
+    }).reset_index()
+    
+    nb = panel["n_bull"]
+    ns = panel["n_bear"]
+    
+    # Índice de optimismo (Antweiler-Frank) y acuerdo de usuarios
+    panel["bullishness"] = np.log((1 + nb) / (1 + ns))
+    
+    ratio = (nb - ns) / (nb + ns)
+    panel["agreement"] = 1 - np.sqrt(1 - ratio.fillna(0) ** 2)
+    
+    # Volumen anormal en escala logarítmica respecto a su promedio móvil de 20 días
+    panel["abn_volume"] = panel.groupby("ticker")["n_msgs"].transform(
+        lambda s: np.log(s / s.rolling(window=20, min_periods=5).mean().shift(1))
+    )
+
+    # Procesamiento de precios y retornos
+    px = prices.sort_values(["ticker", "date"]).copy()
+    px["ret"] = px.groupby("ticker")["close"].pct_change()
+    px["ret_next"] = px.groupby("ticker")["ret"].shift(-1)
+    
+    # Fusión final con el panel de señales sociales
+    result_panel = panel.merge(
+        px, 
+        left_on=["ticker", "trading_date"], 
+        right_on=["ticker", "date"], 
+        how="left"
+    ).drop(columns=["date"])
+    
+    return result_panel
